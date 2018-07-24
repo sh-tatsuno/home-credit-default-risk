@@ -6,6 +6,8 @@ from numpy.random import choice
 from lightgbm import LGBMClassifier
 import lightgbm as lgbm
 from tqdm import trange
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 from sklearn.metrics import roc_auc_score, precision_recall_curve, roc_curve
 from sklearn.model_selection import KFold
@@ -35,14 +37,14 @@ def convert_cat(data):
     for f_ in categorical_feats:
         data[f_], indexer = pd.factorize(data[f_])
 
-def FoldSubmit(all_data, index_cols, model = None, submit=None, return_clf = False, seed = 43):
+def FoldSubmit(all_data, index_cols, model = None, submit=None, return_clf = False):
     np.random.seed(seed)
     folds = KFold(n_splits=4, shuffle=True, random_state=seed)
     data = all_data[all_data.TEST==0]
     y = data.TARGET
     data = data.drop(index_cols,axis=1)
     test = all_data[all_data.TEST==1].drop(index_cols,axis=1)
-    total_score=0
+    total_score=[]
     clf_set=[]
 
     sub_preds = np.zeros(test.shape[0])
@@ -83,10 +85,11 @@ def FoldSubmit(all_data, index_cols, model = None, submit=None, return_clf = Fal
         auc_score = roc_auc_score(val_y.iloc[arrange_inds], oof_preds)
         print('Fold %2d AUC : %.6f' % (n_fold + 1, auc_score))
 
-        total_score += auc_score
+        total_score.append(auc_score)
         if return_clf: clf_set.append(clf)
 
-    print('Total AUC : %.6f' % (total_score/folds.n_splits))
+    print('Mean AUC : %.6f' % (np.mean(total_score)))
+    print('Std AUC : %.6f' % (np.std(total_score)))
 
     if submit!=None:
         submit_data = pd.DataFrame(np.c_[all_data[all_data.TEST==1]['SK_ID_CURR'].values.astype('int32'),sub_preds],
@@ -109,6 +112,67 @@ def null_feat(df, selected=None):
         if (np.sum(df[col] != df[col]) > 0):
             df[col+'_isnull'] = 0
             df[col+'_isnull'] = df[col+'_isnull'].where(df[col] == df[col], 1)
+
+    return
+
+def FoldSubmitwithTargetEnc(all_data, index_cols, model = None, return_clf = False):
+    np.random.seed(seed)
+    folds = KFold(n_splits=4, shuffle=True, random_state=seed)
+    data = all_data[all_data.TEST==0]
+    y = data.TARGET
+    data = data.drop(index_cols,axis=1)
+    test = all_data[all_data.TEST==1].drop(index_cols,axis=1)
+    total_score=[]
+    clf_set=[]
+
+    sub_preds = np.zeros(test.shape[0])
+
+    for n_fold, (trn_idx, val_idx) in enumerate(folds.split(data)):
+        trn_x, trn_y = data.iloc[trn_idx], y.iloc[trn_idx]
+        val_x, val_y = data.iloc[val_idx], y.iloc[val_idx]
+
+        for col in ['OCCUPATION_TYPE', 'ORGANIZATION_TYPE']:
+            trn_x, val_x = add_mean_enc(trn_x, trn_y, val_x, col)
+
+        if model == None:
+            clf = LGBMClassifier(
+                n_estimators=300,
+                learning_rate=0.03,
+                num_leaves=30,
+                colsample_bytree=.8,
+                subsample=.9,
+                max_depth= 7,
+                reg_alpha=.1,
+                reg_lambda=.1,
+                min_split_gain=.01,
+                min_child_weight=2,
+                random_state=seed,
+                silent=True,
+                verbose=-1,
+            )
+        else:
+            clf = model
+
+        arrange_inds = np.r_[choice(np.where(val_y==0)[0], len(np.where(val_y==1)[0])), np.where(val_y==1)[0]]
+        clf.fit(trn_x, trn_y,
+                eval_set= [(trn_x, trn_y), (val_x.iloc[arrange_inds], val_y.iloc[arrange_inds])],
+                eval_metric='auc', verbose=100, early_stopping_rounds=150
+               )
+
+
+        oof_preds = clf.predict_proba(val_x.iloc[arrange_inds], num_iteration=clf.best_iteration_)[:, 1]
+        #sub_preds += clf.predict_proba(test, num_iteration=clf.best_iteration_)[:, 1] / folds.n_splits
+
+        auc_score = roc_auc_score(val_y.iloc[arrange_inds], oof_preds)
+        print('Fold %2d AUC : %.6f' % (n_fold + 1, auc_score))
+
+        total_score.append(auc_score)
+        if return_clf: clf_set.append(clf)
+
+    print('Mean AUC : %.6f' % (np.mean(total_score)))
+    print('Std AUC : %.6f' % (np.std(total_score)))
+
+    if return_clf: return clf_set
 
     return
 
@@ -136,7 +200,7 @@ def eda_rate_bar(df, index_col):
 
 def feature_importances(cols, clf):
     return pd.DataFrame([cols,clf.feature_importances_.tolist()],
-        columns=['feature','score']).sort_values('score', ascending=False)
+        index=['feature','score']).T.sort_values('score', ascending=False)
 
 def one_hot_encoder(df, nan_as_category = True):
     original_columns = list(df.columns)
@@ -144,3 +208,11 @@ def one_hot_encoder(df, nan_as_category = True):
     df = pd.get_dummies(df, columns= categorical_columns, dummy_na= nan_as_category)
     new_columns = [c for c in df.columns if c not in original_columns]
     return df, new_columns
+
+def add_mean_enc(trn_x, trn_y, val_x, col):
+    trn_x['TARGET'] = trn_y
+    means = trn_x.groupby(col).TARGET.mean()
+    trn_x[col+'_mean_enc'] = trn_x[col].map(means)
+    val_x[col+'_mean_enc'] = val_x[col].map(means)
+    trn_x = trn_x.drop('TARGET',axis=1)
+    return trn_x, val_x
